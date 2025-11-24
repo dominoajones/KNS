@@ -1,4 +1,4 @@
-steps = [1 2 3 4 5];
+steps = [11];
 loadonly = 0;
 
 addpath(genpath('/projects/domino/KNS/'));
@@ -332,8 +332,95 @@ if perform(org, 'Load-Relaxation') % {{{
 	savemodel(org,md);
 
 end %}}}
-	if perform(org, 'PDD-Present') % {{{
+	if perform(org, 'Relax-Inversion') % {{{
 		md = loadmodel(org, 'Load-Relaxation');
+		disp('   Initialize basal friction using driving stress');
+		disp('      -- Compute surface slopes and use 10 L2 projections');
+		[sx,sy,s]=slope(md); sslope=averaging(md,s,10);
+		disp('      -- Process surface velocity data');
+		vel = md.inversion.vel_obs;
+		flags=(vel==0); pos1=find(flags); pos2=find(~flags);
+		vel(pos1) = griddata(md.mesh.x(pos2),md.mesh.y(pos2),vel(pos2),md.mesh.x(pos1),md.mesh.y(pos1));
+		vel=max(vel,0.1);
+		disp('      -- Calculate effective pressure');
+		Neff = md.materials.rho_ice*md.geometry.thickness+md.materials.rho_water*md.geometry.base;
+		Neff(find(Neff<=0))=1;
+		disp('      -- Deduce friction coefficient');
+		md.friction.coefficient=sqrt(md.materials.rho_ice*md.geometry.thickness.*(sslope)./(Neff.*vel/md.constants.yts));
+		md.friction.coefficient=min(md.friction.coefficient,150);
+		md.friction.p = 1.0 * ones(md.mesh.numberofelements,1);
+		md.friction.q = 1.0 * ones(md.mesh.numberofelements,1);
+		disp('      -- Extrapolate on ice free and floating ice regions');
+		flags=(md.mask.ice_levelset>0) | (md.mask.ocean_levelset<0); pos1=find(flags); pos2=find(~flags);
+		md.friction.coefficient(pos1) = 1;
+		pos=find(isnan(md.friction.coefficient));
+		md.friction.coefficient(pos)  = 1;
+		pos=find(md.mask.ice_levelset<0 & md.initialization.vel==0);
+		md.friction.coefficient(pos)=150;
+
+		md.inversion=m1qn3inversion();
+		md.inversion.vx_obs=md.initialization.vx;
+		md.inversion.vy_obs=md.initialization.vy;
+		md.inversion.vel_obs=md.initialization.vel;
+		md.inversion.iscontrol=1;
+		md.inversion.cost_functions=[101 103 501];
+		md.inversion.cost_functions_coefficients=ones(md.mesh.numberofvertices,3);
+		md.inversion.cost_functions_coefficients(:,1)=400;
+		md.inversion.cost_functions_coefficients(:,2)=0.01;
+		md.inversion.cost_functions_coefficients(:,3)=1e-7;
+
+		md.inversion.maxsteps = 80;
+		md.inversion.maxiter  = 80;
+		md.inversion.dxmin=0.01;
+		%no cost where no ice
+		pos = find(md.mask.ice_levelset>0 | md.inversion.vel_obs==0);
+		md.inversion.cost_functions_coefficients(pos,[1:2]) = 0;
+
+		md.inversion.control_parameters={'FrictionCoefficient'};
+		md.inversion.min_parameters=0.1*ones(md.mesh.numberofvertices,1);
+		md.inversion.max_parameters=150*ones(md.mesh.numberofvertices,1);
+
+		md.stressbalance.restol=0.01;
+		md.stressbalance.reltol=0.1;
+		md.stressbalance.abstol=NaN;
+
+		plotmodel(md,'data',md.inversion.vel_obs);
+
+		disp('Running inversion');
+		% Solve
+		md.verbose=verbose(0);
+		md.verbose.control=1;
+		md.settings.waitonlock=1;
+		md.cluster=generic('name',oshostname(),'np',2);
+		md.miscellaneous.name='invert';
+		md=solve(md,'Stressbalance');
+
+		md.friction.coefficient=md.results.StressbalanceSolution.FrictionCoefficient;
+
+		disp(' --Running regression');
+		%	in = md.geometry.bed < 0 & 5<md.friction.coefficient<145; disp('Based on basal elevation');
+		in = md.initialization.vel > 100 & 5<md.friction.coefficient<145; disp('Based on velocity');
+		indepbed = md.geometry.bed(find(in));
+		depfriction = md.friction.coefficient(find(in));
+		p = polyfit(indepbed, depfriction, 1);
+		fittedValues = polyval(p, indepbed);
+		pos = md.geometry.bed < 0;
+		md.friction.coefficient(find(pos))= p(1)*md.geometry.bed(find(pos)) + p(2);
+		md.friction.coefficient(find(pos & md.friction.coefficient<0.1)) = 0.1;
+		% Plot the data and the regression line
+		figure;
+		scatter(indepbed, depfriction, 'b'); % Scatter plot of the filtered data
+		hold on;
+		plot(indepbed, fittedValues, 'r', 'LineWidth', 2); % Regression line
+		hold off;
+		%pos=find(~ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/frontforcing/1920.exp',1) & md.mask.ice_levelset>0);
+		%md.friction.coefficient(pos) = 0.1; %This is a test for the forced front. Depending on outcome, should consider a timeseries friction coefficient given 1946 and 1948 shallow sills are causing unrealistic stability in the advance.
+
+		savemodel(org, md);
+
+	end % }}}
+	if perform(org, 'PDD-Present') % {{{
+		md = loadmodel(org, 'Relax-Inversion');
 		[md.mesh.lat,md.mesh.long] = xy2ll(md.mesh.x,md.mesh.y,+1,39,71);
 
 		% Set up SMB D180 class and set PDD factors
@@ -501,30 +588,26 @@ if perform(org,'PDD-Paleo1100') % {{{
 	savemodel(org,md);
 end % }}}
 	if perform(org,'Relaxation-Calving-VonMISES') % {{{
-		md = loadmodel(org, 'Relax-Inversion');
-		md1 = loadmodel('/projects/domino/KNS/Models/KNS_Rheology10convergence-calving-vonmises.mat');
-		md.smb=md1.smb;
-		name='Comparing-withmaskfix';
-		md.levelset.spclevelset=md1.levelset.spclevelset;
-		md.mask.ocean_levelset=md1.mask.ocean_levelset;
+		md = loadmodel(org, 'PDD-Paleo1100');
+		name='B10_gr6.46kPa_fl3.84kPa_bm33myr_relaxinvert_levelsetreinit';
 
-%		in = ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/frontforcing/900.exp',1) & md.geometry.bed<0;
-%		md.levelset.spclevelset = -1*ones(md.mesh.numberofvertices,1);
-%		md.levelset.spclevelset(find(in)) = 1;
-%		pos = find(md.mesh.vertexonboundary);
-%		md.levelset.spclevelset(:) = NaN;
-%		md.levelset.spclevelset(pos) = md.mask.ice_levelset(pos);	
-%		%md.levelset.spclevelset = reinitializelevelset(md, md.levelset.spclevelset);
-%		md.mask.ocean_levelset  = sethydrostaticmask(md);
+		in = ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/no-ice-mask_0603.exp',1) & md.geometry.bed<0;
+	%	in = ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/frontforcing/900.exp',1) & md.geometry.bed<0;
+		md.levelset.spclevelset = -1*ones(md.mesh.numberofvertices,1);
+		md.levelset.spclevelset(find(in)) = 1;
+		pos = find(md.mesh.vertexonboundary);
+		md.levelset.spclevelset(:) = NaN;
+		md.levelset.spclevelset(pos) = md.mask.ice_levelset(pos);	
+%		md.levelset.spclevelset = reinitializelevelset(md, md.levelset.spclevelset);
+		md.mask.ocean_levelset  = sethydrostaticmask(md);
 		md.transient.issmb=1;
 
-%		md.calving=calvingvonmises();
-		md.calving=md1.calving;
+		md.calving=calvingvonmises();
 		
-%		md.calving.min_thickness = md1.calving.min_thickness;
+		md.calving.min_thickness = 10;
 		md.calving.stress_threshold_groundedice=646000;
 		md.calving.stress_threshold_floatingice=384000;
-		md.basalforcings.floatingice_melting_rate=md1.basalforcings.floatingice_melting_rate;
+		md.basalforcings.floatingice_melting_rate=33*ones(md.mesh.numberofvertices,1);
 		md.timestepping.start_time=0;
 		md.timestepping.final_time=500;
 		md.settings.output_frequency=5;
@@ -543,6 +626,7 @@ end % }}}
 
 		savemodel(org,md);
 	end	% }}}
+
 if perform(org, 'Relaxation-Load-VonMISES') % {{{
 	md=loadmodel(org,'Relaxation-Calving-VonMISES');
 	md=loadresultsfromcluster(md);
@@ -2135,93 +2219,6 @@ if perform(org, 'Joel-Load') % {{{
 	savemodel(org,md);
 end %}}}
 
-	if perform(org, 'Relax-Inversion') % {{{
-		md = loadmodel(org, 'Load-Relaxation');
-		disp('   Initialize basal friction using driving stress');
-		disp('      -- Compute surface slopes and use 10 L2 projections');
-		[sx,sy,s]=slope(md); sslope=averaging(md,s,10);
-		disp('      -- Process surface velocity data');
-		vel = md.inversion.vel_obs;
-		flags=(vel==0); pos1=find(flags); pos2=find(~flags);
-		vel(pos1) = griddata(md.mesh.x(pos2),md.mesh.y(pos2),vel(pos2),md.mesh.x(pos1),md.mesh.y(pos1));
-		vel=max(vel,0.1);
-		disp('      -- Calculate effective pressure');
-		Neff = md.materials.rho_ice*md.geometry.thickness+md.materials.rho_water*md.geometry.base;
-		Neff(find(Neff<=0))=1;
-		disp('      -- Deduce friction coefficient');
-		md.friction.coefficient=sqrt(md.materials.rho_ice*md.geometry.thickness.*(sslope)./(Neff.*vel/md.constants.yts));
-		md.friction.coefficient=min(md.friction.coefficient,150);
-		md.friction.p = 1.0 * ones(md.mesh.numberofelements,1);
-		md.friction.q = 1.0 * ones(md.mesh.numberofelements,1);
-		disp('      -- Extrapolate on ice free and floating ice regions');
-		flags=(md.mask.ice_levelset>0) | (md.mask.ocean_levelset<0); pos1=find(flags); pos2=find(~flags);
-		md.friction.coefficient(pos1) = 1;
-		pos=find(isnan(md.friction.coefficient));
-		md.friction.coefficient(pos)  = 1;
-		pos=find(md.mask.ice_levelset<0 & md.initialization.vel==0);
-		md.friction.coefficient(pos)=150;
-
-		md.inversion=m1qn3inversion();
-		md.inversion.vx_obs=md.initialization.vx;
-		md.inversion.vy_obs=md.initialization.vy;
-		md.inversion.vel_obs=md.initialization.vel;
-		md.inversion.iscontrol=1;
-		md.inversion.cost_functions=[101 103 501];
-		md.inversion.cost_functions_coefficients=ones(md.mesh.numberofvertices,3);
-		md.inversion.cost_functions_coefficients(:,1)=400;
-		md.inversion.cost_functions_coefficients(:,2)=0.01;
-		md.inversion.cost_functions_coefficients(:,3)=1e-7;
-
-		md.inversion.maxsteps = 80;
-		md.inversion.maxiter  = 80;
-		md.inversion.dxmin=0.01;
-		%no cost where no ice
-		pos = find(md.mask.ice_levelset>0 | md.inversion.vel_obs==0);
-		md.inversion.cost_functions_coefficients(pos,[1:2]) = 0;
-
-		md.inversion.control_parameters={'FrictionCoefficient'};
-		md.inversion.min_parameters=0.1*ones(md.mesh.numberofvertices,1);
-		md.inversion.max_parameters=150*ones(md.mesh.numberofvertices,1);
-
-		md.stressbalance.restol=0.01;
-		md.stressbalance.reltol=0.1;
-		md.stressbalance.abstol=NaN;
-
-		plotmodel(md,'data',md.inversion.vel_obs);
-
-		disp('Running inversion');
-		% Solve
-		md.verbose=verbose(0);
-		md.verbose.control=1;
-		md.settings.waitonlock=1;
-		md.cluster=generic('name',oshostname(),'np',2);
-		md.miscellaneous.name='invert';
-		md=solve(md,'Stressbalance');
-
-		md.friction.coefficient=md.results.StressbalanceSolution.FrictionCoefficient;
-
-		disp(' --Running regression');
-		%	in = md.geometry.bed < 0 & 5<md.friction.coefficient<145; disp('Based on basal elevation');
-		in = md.initialization.vel > 100 & 5<md.friction.coefficient<145; disp('Based on velocity');
-		indepbed = md.geometry.bed(find(in));
-		depfriction = md.friction.coefficient(find(in));
-		p = polyfit(indepbed, depfriction, 1);
-		fittedValues = polyval(p, indepbed);
-		pos = md.geometry.bed < 0;
-		md.friction.coefficient(find(pos))= p(1)*md.geometry.bed(find(pos)) + p(2);
-		md.friction.coefficient(find(pos & md.friction.coefficient<0.1)) = 0.1;
-		% Plot the data and the regression line
-		figure;
-		scatter(indepbed, depfriction, 'b'); % Scatter plot of the filtered data
-		hold on;
-		plot(indepbed, fittedValues, 'r', 'LineWidth', 2); % Regression line
-		hold off;
-		%pos=find(~ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/frontforcing/1920.exp',1) & md.mask.ice_levelset>0);
-		%md.friction.coefficient(pos) = 0.1; %This is a test for the forced front. Depending on outcome, should consider a timeseries friction coefficient given 1946 and 1948 shallow sills are causing unrealistic stability in the advance.
-
-		savemodel(org, md);
-
-	end % }}}
 		disp('  --spc nunatak');
 	out=ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/frontforcing/nunatak-ext.exp',1);
 	in=ContourToNodes(md.mesh.x,md.mesh.y,'/projects/domino/KNS/Exp/frontforcing/nunatak-int.exp',1);
